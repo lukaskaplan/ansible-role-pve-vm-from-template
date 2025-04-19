@@ -1,0 +1,278 @@
+---
+- name: Install pip3, proxmoxer, libguestfs-tools
+  ansible.builtin.apt:
+    name: "{{ apt_package }}"
+    state: present
+  with_items:
+    - python3-pip
+    - python3-proxmoxer
+    - libguestfs-tools
+    - python3-jmespath
+  loop_control:
+    loop_var: apt_package
+
+- name: Authenticate and get ticket from Proxmox
+  ansible.builtin.uri:
+    url: "https://{{ pve_vm_from_template_api_host }}/api2/json/access/ticket"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      username: "{{ pve_vm_from_template_api_user }}"
+      password: "{{ pve_vm_from_template_api_password }}"
+    validate_certs: false
+  register: login
+
+- name: List Proxmox nodes using the ticket
+  ansible.builtin.uri:
+    url: "https://{{ pve_vm_from_template_api_host }}/api2/json/nodes"
+    method: GET
+    headers:
+      Cookie: "PVEAuthCookie={{ login.json.data.ticket }}"
+    validate_certs: false
+  register: result
+
+- name: DEBUG - Display node name
+  ansible.builtin.debug:
+    var: result.json.data[0].node
+  when: debug_on
+
+- name: Set node name
+  ansible.builtin.set_fact:
+    node: "{{ result.json.data[0].node }}"
+
+- name: Clone VM from template
+  community.general.proxmox_kvm:
+    api_host: "{{ pve_vm_from_template_api_host }}"
+    api_user: "{{ pve_vm_from_template_api_user }}"
+    api_password: "{{ pve_vm_from_template_api_password }}"
+    # api_token_id: "{{ token_id }}"
+    # api_token_secret: "{{ token_secret }}"
+    node: "{{ node }}"
+    clone: "{{ pve_vm_from_template_template }}"
+    name: "{{ pve_vm_from_template_name }}"
+    full: false
+    timeout: 500
+  register: vm
+
+- name: DEBUG - vm net config
+  ansible.builtin.debug:
+    msg: "{{ pve_vm_from_template_net }}"
+  when: debug_on
+
+- name: DEBUG - result of VM creation
+  ansible.builtin.debug:
+    msg: "{{ vm }}"
+  when: debug_on
+
+- name: Download remote SSH Key
+  ansible.builtin.get_url:
+    url: "{{ pve_vm_from_template_root_ssh_key_url }}"
+    dest: /tmp/root.keys
+    mode: "0600"
+  when:
+    - vm.changed # noqa: no-handler
+    - not pve_vm_from_template_root_ssh_key_from_proxmox
+    - pve_vm_from_template_root_ssh_key_url is defined
+
+- name: Use local /root/.ssh/authorized_keys
+  ansible.builtin.copy:
+    src: /root/.ssh/authorized_keys
+    dest: /tmp/root.keys
+    remote_src: true
+    mode: "0600"
+  when:
+    - vm.changed # noqa: no-handler
+    - pve_vm_from_template_root_ssh_key_from_proxmox
+
+- name: Cloud-init + VM CPU,RAM,Disk settings  # noqa: no-changed-when
+  ansible.builtin.command: "{{ qm_cmd }}"
+  with_items:
+    - "qm set {{ vm.vmid }} --ciuser root --cipassword {{ pve_vm_from_template_root_password }} --sshkeys /tmp/root.keys"
+    # Start VM on boot:
+    - "qm set {{ vm.vmid }} --onboot 1"
+    - "qm set {{ vm.vmid }} --ciupgrade 0"
+    - "qm set {{ vm.vmid }} --cores {{ pve_vm_from_template_cores }}"
+    - "qm set {{ vm.vmid }} --cpu host"
+    - "qm set {{ vm.vmid }} --memory {{ pve_vm_from_template_memory }}"
+    - "qm set {{ vm.vmid }} --watchdog model=i6300esb,action=reset"
+    - "qm disk resize {{ vm.vmid }} scsi0 {{ pve_vm_from_template_disk }}"
+  when: vm.changed # noqa: no-handler
+  loop_control:
+    loop_var: qm_cmd
+
+# TODO - this depends on file snippets created on proxmox host (playbook 010), which is not ideal
+# - name: Disable cloud-init network config
+#  ansible.builtin.command: "qm set {{ vm.vmid }} --cicustom 'network=local:snippets/disable-network-config.cfg'"
+#  when: vm.changed  # noqa: no-handler
+
+- name: Network settings - eth0 - DHCP  # noqa: no-changed-when
+  ansible.builtin.command: "qm set {{ vm.vmid }} --ipconfig0 ip=dhcp"
+  when: vm.changed and pve_vm_from_template_net0_config == 'dhcp'
+
+- name: Network settings - eth0 - static ip with gateway  # noqa: no-changed-when
+  ansible.builtin.command: "qm set {{ vm.vmid }} --ipconfig0 ip={{ pve_vm_from_template_net0_ip }}/{{ pve_vm_from_template_net0_mask }},gw={{ pve_vm_from_template_net0_gw }}"  # noqa: yaml[line-length]
+  when: vm.changed and pve_vm_from_template_net0_config == 'static' and pve_vm_from_template_net0_gw not in (none, '')
+
+- name: Network settings - eth0 - static ip without gateway  # noqa: no-changed-when
+  ansible.builtin.command: "qm set {{ vm.vmid }} --ipconfig0 ip={{ pve_vm_from_template_net0_ip }}/{{ pve_vm_from_template_net0_mask }}"
+  when: vm.changed and pve_vm_from_template_net0_config == 'static' and pve_vm_from_template_net0_gw in (none, '')
+
+- name: Add and configure second network interface
+  when: vm.changed and pve_vm_from_template_net1
+  block:
+    - name: Add second network interface to the VM  # noqa: no-changed-when
+      ansible.builtin.command: "qm set {{ vm.vmid }} --net1 virtio,bridge={{ pve_vm_from_template_net1_bridge }}"
+
+    - name: Network settings - eth1 - DHCP  # noqa: no-changed-when
+      ansible.builtin.command: "qm set {{ vm.vmid }} --ipconfig1 ip=dhcp"
+      when: vm.changed and pve_vm_from_template_net1_config == 'dhcp'
+
+    - name: Network settings - eth1 - Static IP with gateway  # noqa: no-changed-when
+      ansible.builtin.command: "qm set {{ vm.vmid }} --ipconfig1 ip={{ pve_vm_from_template_net1_ip }}/{{ pve_vm_from_template_net1_mask }},gw={{ pve_vm_from_template_net1_gw }}"  # noqa: yaml[line-length]
+      when: vm.changed and pve_vm_from_template_net0_config == 'static' and pve_vm_from_template_net1_gw not in (None, '')
+
+    - name: Network settings - eth1 - Static IP without gateway  # noqa: no-changed-when
+      ansible.builtin.command: "qm set {{ vm.vmid }} --ipconfig1 ip={{ pve_vm_from_template_net1_ip }}/{{ pve_vm_from_template_net1_mask }}"
+      when: vm.changed and pve_vm_from_template_net0_config == 'static' and pve_vm_from_template_net1_gw in (None, '')
+
+- name: Network settings - Static DNS  # noqa: no-changed-when
+  ansible.builtin.command: "qm set {{ vm.vmid }} --nameserver {{ pve_vm_from_template_nameserver }}"
+  when: vm.changed and pve_vm_from_template_net0_config == 'static'
+
+- name: Wait for VM to be created
+  ansible.builtin.wait_for:
+    timeout: 5
+
+- name: Start VM
+  community.general.proxmox_kvm:
+    api_host: "{{ pve_vm_from_template_api_host }}"
+    api_user: "{{ pve_vm_from_template_api_user }}"
+    api_password: "{{ pve_vm_from_template_api_password }}"
+    # api_token_id: "{{ token_id }}"
+    # api_token_secret: "{{ token_secret }}"
+    node: "{{ node }}"
+    name: "{{ pve_vm_from_template_name }}"
+    state: started
+  register: startvm
+
+- name: DEBUG - start VM
+  ansible.builtin.debug:
+    msg: "{{ startvm }}"
+  when: debug_on
+
+- name: Wait for VM to be running
+  ansible.builtin.wait_for:
+    timeout: 5
+  when: startvm.changed # noqa: no-handler
+
+# ------------------------------------------------------------------------
+- name: Start block of adding VM to the ansible inventory
+  when: pve_vm_from_template_add_to_inventory
+  block:
+    - name: Get IP address of the VM assigned by DHCP
+      when: pve_vm_from_template_net0_config == 'dhcp'
+      block:
+        - name: Poll VM Status
+          community.general.pve_vm_info:
+            api_host: "{{ pve_vm_from_template_api_host }}"
+            api_user: "{{ pve_vm_from_template_api_user }}"
+            api_password: "{{ pve_vm_from_template_api_password }}"
+            # api_token_id: "{{ token_id }}"
+            # api_token_secret: "{{ token_secret }}"
+            name: "{{ pve_vm_from_template_name }}"
+          register: vm_info
+          until: "'running' in vm_info.pve_vms[0].status"
+          retries: 10 # Number of retries before giving up
+          delay: 5 # Delay (in seconds) between retries
+
+        - name: DEBUG - vm_info
+          ansible.builtin.debug:
+            var: vm_info
+          when: debug_on
+
+        - name: Get VM IP
+          ansible.builtin.command: "qm agent {{ vm_info.pve_vms[0].vmid }} network-get-interfaces"
+          register: vmint
+          changed_when: false
+
+        - name: DEBUG - vmint
+          ansible.builtin.debug:
+            msg: "{{ vmint.stdout }}"
+          when: debug_on
+
+        - name: Get VM IP address
+          ansible.builtin.set_fact:
+            vmip: "{{ vmint.stdout | from_json | json_query(query_string) }}"
+          vars:
+            query_string: '[?name==`eth0`].["ip-addresses"]|[0][0]|[?"ip-address-type"==`ipv4`].["ip-address"][0][0]'
+
+    - name: Get IP address of the VM assigned staticaly
+      when: pve_vm_from_template_net0_config == 'static'
+      block:
+        - name: Get VM IP address
+          ansible.builtin.set_fact:
+            vmip: "{{ pve_vm_from_template_net0_ip }}"
+
+    - name: DEBUG - vmip
+      ansible.builtin.debug:
+        msg: "{{ vmip }}"
+      when: debug_on
+
+    - name: Check if ansible group exists in the inventory file
+      ansible.builtin.shell:
+        cmd: "grep -qxF '[{{ pve_vm_from_template_ansible_group }}]' {{ pve_vm_from_template_inventory_file }}"
+      delegate_to: localhost
+      register: line_check
+      # if inventory file does not exists RC = 2, then fail
+      failed_when: line_check.rc > 1
+      changed_when: false
+
+    - name: DEBUG - line_check
+      ansible.builtin.debug:
+        msg: "Line check RC: {{ line_check.rc }}"
+      when: debug_on
+
+    - name: Create ansible group in the inventory file
+      ansible.builtin.lineinfile:
+        path: "{{ pve_vm_from_template_inventory_file }}"
+        # regexp: "^\\[{{ pve_vm_from_template_ansible_group }}\\]"
+        line: "\n[{{ pve_vm_from_template_ansible_group }}]"
+        state: present
+      delegate_to: localhost
+      throttle: 1 # Add a throttle to ensure only one iteration at a time#insertafter: '\[zabbix_proxy_6_0\]'
+      when: line_check.rc == 1
+
+    - name: Prepare host line for static inventory (with ssh proxyjump)
+      ansible.builtin.set_fact:
+        ansible_hosts_line: "{{ pve_vm_from_template_name }} ansible_host={{ vmip }} ansible_user=root locality={{ locality }} ansible_ssh_common_args='{{ ansible_ssh_common_args }}'"  # noqa: yaml[line-length]
+      when: ansible_ssh_common_args is defined
+
+    - name: Prepare host line for static inventory (direct ssh access)
+      ansible.builtin.set_fact:
+        ansible_hosts_line: "{{ pve_vm_from_template_name }} ansible_host={{ vmip }} ansible_user=root locality={{ locality }}"
+      when: ansible_ssh_common_args is not defined
+
+    - name: Remove existing host from any group
+      ansible.builtin.lineinfile:
+        path: "{{ pve_vm_from_template_inventory_file }}"
+        state: absent
+        regexp: "^{{ pve_vm_from_template_name }}"
+      delegate_to: localhost
+
+    - name: Add host to the static inventory
+      ansible.builtin.lineinfile:
+        path: "{{ pve_vm_from_template_inventory_file }}"
+        # regexp to update existing line instead of adding new one
+        regexp: "^{{ pve_vm_from_template_name }}"
+        # if regexp does not match, insert new line
+        insertafter: "^\\[{{ pve_vm_from_template_ansible_group }}\\]"
+        line: "{{ ansible_hosts_line }}"
+      delegate_to: localhost
+      throttle: 1 # Add a throttle to ensure only one iteration at a time#insertafter: '\[zabbix_proxy_6_0\]'
+
+#    - name: Add host to the dynamic inventory
+#      ansible.builtin.add_host:
+#        hostname: "{{ vmip }}"
+#        group: dynamic_hosts
+
+# ------------------------------------------------------------------------

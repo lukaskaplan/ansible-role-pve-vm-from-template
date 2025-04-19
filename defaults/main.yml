@@ -1,0 +1,60 @@
+---
+# Access to the proxmox API
+# (common admin user used in the web gui):
+pve_vm_from_template_api_host: "{{ ansible_host }}:8006"
+pve_vm_from_template_api_user: root@pam
+pve_vm_from_template_api_password: changeme
+
+# Name of the VM template
+pve_vm_from_template_template: template
+
+# Name of the created VM
+pve_vm_from_template_name: newvm
+# Number of vCPU cores
+pve_vm_from_template_cores: 1
+# RAM size in MiB
+pve_vm_from_template_memory: 1024
+# Disk size
+pve_vm_from_template_disk: 5G
+
+# Network config [dhcp | static]:
+pve_vm_from_template_net0_config: dhcp
+# IP address x.x.x.x
+pve_vm_from_template_net0_ip: 127.0.1.2/24
+# mask yy (CIDR format)
+pve_vm_from_template_net0_mask: 24
+# Gateway
+pve_vm_from_template_net0_gw: 127.0.1.1
+# DNS Nameserver
+pve_vm_from_template_nameserver: 1.1.1.1
+
+### Optional ###
+# Add second interface? [true|false]
+pve_vm_from_template_net1: false
+# which bridge is interface connected to
+pve_vm_from_template_net1_bridge: vmbr1
+# Network config [dhcp | static]:
+pve_vm_from_template_net1_config: dhcp
+# IP address x.x.x.x
+pve_vm_from_template_net1_ip:
+# mask yy (CIDR format)
+pve_vm_from_template_net1_mask: 24
+# Gateway
+pve_vm_from_template_net1_gw:
+
+# Root password of the VM
+pve_vm_from_template_root_password: changeme
+
+# SSH key
+  # if true, use root keys from proxmox root's authorized_keys
+  # if false, use root key from pve_vm_from_template_root_ssh_key_url
+pve_vm_from_template_root_ssh_key_from_proxmox: true
+pve_vm_from_template_root_ssh_key_url: https://example.com/root.keys
+
+# Add VM to ansible hosts
+pve_vm_from_template_add_to_inventory: false
+pve_vm_from_template_inventory_file: "{{ inventory_dir }}/hosts"
+pve_vm_from_template_ansible_group: "vms"
+
+# Turn on/off debug mode
+pve_vm_from_template_debug_on: false
